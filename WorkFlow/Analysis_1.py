@@ -5,22 +5,21 @@ import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.arima.model import ARIMA
-from fbprophet import Prophet
-from pygam import LinearGAM, s
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from scipy.integrate import odeint
 from scipy.optimize import minimize
-from sklearn.ensemble import IsolationForest
+from scipy.stats import skew, kurtosis
+from sklearn.ensemble import IsolationForest, RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from sklearn.model_selection import TimeSeriesSplit
 
 # ======================
 # 目录配置
 # ======================
 BASE_DIR = "D:/python/Code/DPW_COVID_19"
 DATA_DIR = os.path.join(BASE_DIR, "Data/country_data")  # 原始数据目录
-RESULTS_DIR = os.path.join(BASE_DIR, "Analysis_Results")  # 统一结果目录
+RESULTS_DIR = os.path.join(BASE_DIR, "Analysis_Results2")  # 统一结果目录
 
 # 创建标准化子目录结构
 SUB_DIRS = {
@@ -123,71 +122,77 @@ class CountryAnalyzer:
 
         return forecast.predicted_mean
 
-    def prophet_forecast(self):
-        """Prophet预测"""
-        df_prophet = self.df.reset_index().rename(
-            columns={'Day': 'ds', self.cases_col: 'y'})
+    def holtwinters_forecast(self):
+        """Holt-Winters预测"""
+        try:
+            model = ExponentialSmoothing(self.df[self.cases_col],
+                                         seasonal='additive',
+                                         seasonal_periods=7)
+            results = model.fit()
+            forecast = results.forecast(30)
 
-        model = Prophet(seasonality_mode='multiplicative')
-        model.fit(df_prophet)
-        future = model.make_future_dataframe(periods=30)
-        forecast = model.predict(future)
+            # 保存结果
+            forecast_df = pd.DataFrame(
+                {'Date': forecast.index, 'HW_Forecast': forecast.values}
+            ).set_index('Date')
+            self.save_result(forecast_df, 'forecasts', 'holtwinters_forecast.csv')
 
-        # 保存结果
-        forecast_df = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
-        self.save_result(forecast_df.set_index('ds'), 'forecasts', 'prophet_forecast.csv')
+            # 可视化
+            plt.figure(figsize=(12, 6))
+            self.df[self.cases_col].plot(label='Historical')
+            forecast.plot(label='Holt-Winters Forecast')
+            plt.title(f"Holt-Winters Forecast - {self.country}")
+            plt.legend()
+            self.save_result(None, 'forecasts', 'holtwinters_forecast.png', 'png')
 
-        # 可视化
-        fig = model.plot(forecast)
-        plt.title(f"Prophet Forecast - {self.country}")
-        self.save_result(None, 'forecasts', 'prophet_forecast.png', 'png')
+            return forecast.values
+        except Exception as e:
+            print(f"Holt-Winters failed for {self.country}: {str(e)}")
+            return np.zeros(30)
 
-        return forecast.yhat[-30:].values
+    def random_forest_forecast(self):
+        """随机森林预测"""
+        try:
+            # 创建滞后特征
+            look_back = 14
+            df = self.df[[self.cases_col]].copy()
+            for i in range(1, look_back + 1):
+                df[f'lag_{i}'] = df[self.cases_col].shift(i)
 
-    def lstm_forecast(self):
-        """LSTM预测"""
-        scaler = MinMaxScaler()
-        scaled_data = scaler.fit_transform(self.df[[self.cases_col]])
+            df.dropna(inplace=True)
 
-        # 创建时间序列数据集
-        def create_dataset(dataset, look_back=14):
-            X, Y = [], []
-            for i in range(len(dataset) - look_back - 1):
-                X.append(dataset[i:(i + look_back), 0])
-                Y.append(dataset[i + look_back, 0])
-            return np.array(X), np.array(Y)
+            X = df.drop(columns=[self.cases_col])
+            y = df[self.cases_col]
 
-        X, y = create_dataset(scaled_data)
-        X = X.reshape(X.shape[0], X.shape[1], 1)
+            # 时间序列交叉验证
+            tscv = TimeSeriesSplit(n_splits=5)
+            model = RandomForestRegressor(n_estimators=100, random_state=42)
 
-        # 构建LSTM模型
-        model = Sequential([
-            LSTM(50, return_sequences=True, input_shape=(X.shape[1], 1)),
-            LSTM(50),
-            Dense(1)
-        ])
-        model.compile(optimizer='adam', loss='mse')
-        model.fit(X, y, epochs=20, batch_size=32, verbose=0)
+            # 训练最终模型
+            model.fit(X, y)
 
-        # 生成预测
-        inputs = scaled_data[-14:]
-        forecast = []
-        for _ in range(30):
-            x_input = inputs[-14:].reshape(1, 14, 1)
-            y_pred = model.predict(x_input, verbose=0)
-            forecast.append(y_pred[0][0])
-            inputs = np.append(inputs, y_pred)
+            # 递归预测
+            forecast = []
+            last_window = X.iloc[-1].values
 
-        forecast = scaler.inverse_transform(np.array(forecast).reshape(-1, 1))
-        forecast_dates = pd.date_range(self.df.index[-1], periods=31)[1:]
+            for _ in range(30):
+                pred = model.predict([last_window])[0]
+                forecast.append(pred)
+                last_window = np.roll(last_window, -1)
+                last_window[-1] = pred
 
-        # 保存结果
-        forecast_df = pd.DataFrame(
-            {'Date': forecast_dates, 'LSTM_Forecast': forecast.flatten()}
-        ).set_index('Date')
-        self.save_result(forecast_df, 'forecasts', 'lstm_forecast.csv')
+            forecast_dates = pd.date_range(self.df.index[-1], periods=31)[1:]
 
-        return forecast.flatten()
+            # 保存结果
+            forecast_df = pd.DataFrame(
+                {'Date': forecast_dates, 'RF_Forecast': forecast}
+            ).set_index('Date')
+            self.save_result(forecast_df, 'forecasts', 'rf_forecast.csv')
+
+            return np.array(forecast)
+        except Exception as e:
+            print(f"Random Forest forecast failed for {self.country}: {str(e)}")
+            return np.zeros(30)
 
     def seir_modeling(self):
         """SEIR传染病模型拟合"""
@@ -256,8 +261,8 @@ class CountryAnalyzer:
         self.time_series_analysis()
 
         arima_fc = self.arima_forecast()
-        prophet_fc = self.prophet_forecast()
-        lstm_fc = self.lstm_forecast()
+        hw_fc = self.holtwinters_forecast()
+        rf_fc = self.random_forest_forecast()
         self.seir_modeling()
         self.anomaly_detection()
 
@@ -266,8 +271,8 @@ class CountryAnalyzer:
         self.df[self.cases_col].plot(label='Historical')
         forecast_dates = pd.date_range(self.df.index[-1], periods=31)[1:]
         plt.plot(forecast_dates, arima_fc, label='ARIMA')
-        plt.plot(forecast_dates, prophet_fc, label='Prophet')
-        plt.plot(forecast_dates, lstm_fc, label='LSTM')
+        plt.plot(forecast_dates, hw_fc, label='Holt-Winters')
+        plt.plot(forecast_dates, rf_fc, label='Random Forest')
         plt.title(f"Forecast Comparison - {self.country}")
         plt.legend()
         self.save_result(None, 'comparisons', 'forecast_comparison.png', 'png')
@@ -280,7 +285,7 @@ def main():
     create_directory_structure()
 
     processed_countries = set(
-        f.split('_')[0] for f in os.listdir(RESULTS_DIR) if '_stats.txt' in f)
+        f.split('_')[0] for f in os.listdir(RESULTS_DIR) if '_stats2.txt' in f)
 
     for file in os.listdir(DATA_DIR):
         if file.endswith('.csv'):
