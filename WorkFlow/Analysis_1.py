@@ -13,13 +13,13 @@ from sklearn.ensemble import IsolationForest, RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import TimeSeriesSplit
-
+import matplotlib.dates as mdates  
 # ======================
 # 目录配置
 # ======================
 BASE_DIR = "D:/python/Code/DPW_COVID_19"
 DATA_DIR = os.path.join(BASE_DIR, "Data/country_data")  # 原始数据目录
-RESULTS_DIR = os.path.join(BASE_DIR, "Analysis_Results2")  # 统一结果目录
+RESULTS_DIR = os.path.join(BASE_DIR, "Analysis_Results1")  # 统一结果目录
 
 # 创建标准化子目录结构
 SUB_DIRS = {
@@ -164,6 +164,9 @@ class CountryAnalyzer:
             X = df.drop(columns=[self.cases_col])
             y = df[self.cases_col]
 
+            # 获取特征列名
+            feature_names = X.columns.tolist()
+
             # 时间序列交叉验证
             tscv = TimeSeriesSplit(n_splits=5)
             model = RandomForestRegressor(n_estimators=100, random_state=42)
@@ -173,13 +176,21 @@ class CountryAnalyzer:
 
             # 递归预测
             forecast = []
-            last_window = X.iloc[-1].values
+            last_window = X.iloc[[-1]]  # 保持DataFrame格式
 
             for _ in range(30):
-                pred = model.predict([last_window])[0]
+                pred = model.predict(last_window)[0]
                 forecast.append(pred)
-                last_window = np.roll(last_window, -1)
-                last_window[-1] = pred
+                
+                # 更新滞后特征
+                new_row = {}
+                for i in range(1, look_back):
+                    new_row[f'lag_{i}'] = last_window[f'lag_{i+1}'].values[0]
+                new_row[f'lag_{look_back}'] = pred
+                
+                # 创建新的DataFrame行
+                last_window = pd.DataFrame([new_row], columns=feature_names, 
+                                        index=[last_window.index[-1] + pd.Timedelta(days=1)])
 
             forecast_dates = pd.date_range(self.df.index[-1], periods=31)[1:]
 
@@ -267,12 +278,28 @@ class CountryAnalyzer:
         self.anomaly_detection()
 
         # 多模型预测对比
-        plt.figure(figsize=(15, 7))
-        self.df[self.cases_col].plot(label='Historical')
-        forecast_dates = pd.date_range(self.df.index[-1], periods=31)[1:]
-        plt.plot(forecast_dates, arima_fc, label='ARIMA')
-        plt.plot(forecast_dates, hw_fc, label='Holt-Winters')
-        plt.plot(forecast_dates, rf_fc, label='Random Forest')
+        plt.close('all')
+        fig = plt.figure(figsize=(15, 7))
+        ax = fig.add_subplot(111)
+
+        # 统一日期类型（关键修改）
+        historical_dates = self.df.index.to_pydatetime()
+        forecast_dates = pd.date_range(
+            self.df.index[-1], 
+            periods=31
+        )[1:].to_pydatetime()
+
+        # 显式设置日期格式（需要mdates）
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+        plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+
+        # 绘制数据
+        ax.plot(historical_dates, self.df[self.cases_col], label='Historical')
+        ax.plot(forecast_dates, arima_fc, label='ARIMA')
+        ax.plot(forecast_dates, hw_fc, label='Holt-Winters')
+        ax.plot(forecast_dates, rf_fc, label='Random Forest')
+
         plt.title(f"Forecast Comparison - {self.country}")
         plt.legend()
         self.save_result(None, 'comparisons', 'forecast_comparison.png', 'png')
