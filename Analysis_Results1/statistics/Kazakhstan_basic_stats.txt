@@ -1,0 +1,4 @@
+mean: 40.0900
+std: 88.3519
+skewness: 3.9753
+kurtosis: 19.1761

@@ -1,0 +1,4 @@
+mean: 0.0000
+std: 0.0000
+skewness: nan
+kurtosis: nan
